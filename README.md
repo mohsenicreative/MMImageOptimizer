@@ -1,14 +1,14 @@
 # MM Image Optimizer
 
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/mohseni-mr/MMImageOptimizer?style=for-the-badge)
-![GitHub stars](https://img.shields.io/github/stars/mohseni-mr/MMImageOptimizer?style=for-the-badge)
-![GitHub issues](https://img.shields.io/github/issues/mohseni-mr/MMImageOptimizer?style=for-the-badge)
-![License](https://img.shields.io/github/license/mohseni-mr/MMImageOptimizer?style=for-the-badge)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/mohsenicreative/MMImageOptimizer?style=for-the-badge)
+![GitHub stars](https://img.shields.io/github/stars/mohsenicreative/MMImageOptimizer?style=for-the-badge)
+![GitHub issues](https://img.shields.io/github/issues/mohsenicreative/MMImageOptimizer?style=for-the-badge)
+![License](https://img.shields.io/github/license/mohsenicreative/MMImageOptimizer?style=for-the-badge)
 
 ---
 
 <p align="center">
-    <img width="96" alt="MM Image Optimizer Logo" src='https://raw.githubusercontent.com/mohseni-mr/MMImageOptimizer/refs/heads/main/mohseni-blue-logo-96.png'/>
+    <img width="96" alt="MM Image Optimizer Logo" src='https://raw.githubusercontent.com/mohsenicreative/MMImageOptimizer/refs/heads/main/mohseni-blue-logo-96.png'/>
 </p>
 
 <h1 align="center">MM Image Optimizer</h1>
@@ -52,7 +52,7 @@
   <img src="https://img.shields.io/badge/Direct%20Download-Cloudflare%20R2-blue?style=for-the-badge" alt="Direct Download"/>
 </a>
 
-**[Download the latest release from GitHub](https://github.com/mohseni-mr/MMImageOptimizer/releases/latest)**
+**[Download the latest release from GitHub](https://github.com/mohsenicreative/MMImageOptimizer/releases/latest)**
 
 or use the always-latest direct link:
 
@@ -72,7 +72,7 @@ or use the always-latest direct link:
 ## 🖼️ UI Screenshot
 
 <p align="center">
-    <img alt="MM Image Optimizer UI Screeshot" src='https://raw.githubusercontent.com/mohseni-mr/MMImageOptimizer/refs/heads/main/ui-screenshot.png'/>
+    <img alt="MM Image Optimizer UI Screeshot" src='https://raw.githubusercontent.com/mohsenicreative/MMImageOptimizer/refs/heads/main/ui-screenshot.png'/>
 </p>
 
 ---
@@ -209,8 +209,8 @@ or use the always-latest direct link:
 ## 📣 Connect
 
 - [Author Website](https://mohsenicreative.com)
-- [GitHub Issues](https://github.com/mohseni-mr/MMImageOptimizer/issues)
-- [Releases](https://github.com/mohseni-mr/MMImageOptimizer/releases)
+- [GitHub Issues](https://github.com/mohsenicreative/MMImageOptimizer/issues)
+- [Releases](https://github.com/mohsenicreative/MMImageOptimizer/releases)
 
 ---
 

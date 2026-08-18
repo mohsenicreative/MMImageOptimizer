@@ -1,7 +1,7 @@
 [Setup]
 AppName=MM Image Optimizer
 AppId={{3c009390-4814-4fbf-b032-bc049a9dab29}}
-AppVersion=1.0.0
+AppVersion=1.3.0
 AppContact=Mohammadreza Mohseni
 AppPublisher=Mohammadreza Mohseni
 AppPublisherURL=https://mohsenicreative.com
