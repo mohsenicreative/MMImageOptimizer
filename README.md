@@ -155,6 +155,46 @@ or use the always-latest direct link:
 
 ---
 
+## 📋 Changelog
+
+Full details for every release are on the [Releases page](https://github.com/mohsenicreative/MMImageOptimizer/releases).
+
+### v1.3.0 — 2026-08-19
+
+**New features**
+
+- Cancel / Pause batch processing mid-run
+- Per-file status list (thumbnail, filename, success/partial/skipped/failed) instead of aggregate stats only
+- "Preserve folder structure" option for recursive input, so same-named files from different subfolders no longer collide
+- "Skip Existing Files" option
+- Settings (output folder, formats, quality, resolutions, and more) now persist between sessions
+
+**Under the hood**
+
+- Replaced the bundled `cwebp.exe`, `avifenc.exe`, `oxipng.exe`, `pngquant.exe`, and `magick.exe` with in-process Python libraries — smaller installer (bundled binaries down from ~53 MB to ~12 MB) and faster per-file processing
+- GPU acceleration removed (it was ImageMagick-specific with no equivalent in the new resize engine, so the option was dropped rather than left non-functional)
+
+**Bug fixes**
+
+- Fixed a crash when a resize operation failed
+- Fixed the "file already exists" handling, which called a method that didn't exist
+- Fixed duplicate processing of files during recursive folder scans on Windows
+- Fixed the end-of-batch error summary, which was never actually populated
+
+### v1.2.0 — 2025-08-29
+
+- Robust long/Unicode path handling for all file operations
+- Faster image dimension detection (no full image decode just to read width/height)
+- Stricter Windows filename validation with clear in-app warnings
+- Reworked resizing engine for higher-quality multi-resolution output
+- Improved resolution dialog with live validation and dimension previews
+
+### v1.0.0 — 2025-07-29
+
+- Initial public release: batch optimization, drag & drop, PNG/JPEG/WebP/AVIF output, lossless & lossy modes, metadata stripping, multi-threading, GPU acceleration, Windows installer
+
+---
+
 ## 📝 Credits & Acknowledgments
 
 - **libvips** — [libvips.org](https://www.libvips.org/) (via [pyvips](https://github.com/libvips/pyvips))
