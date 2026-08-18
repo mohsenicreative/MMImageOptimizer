@@ -27,7 +27,6 @@
 - **Lossless & lossy modes**
 - **Metadata stripping** for privacy & size
 - **Multi-threaded** for maximum speed
-- **GPU acceleration** (if available)
 - **Modern, easy-to-use interface**
 - **Professional Windows installer**
 - **No telemetry, no ads, 100% free**
@@ -94,8 +93,6 @@ or use the always-latest direct link:
 
 - Enable "Strip Metadata" for privacy, smaller files, and removing all extra info—including AI workflow data and creation history in AI-generated images.
 
-- Turn on GPU Acceleration (if available) for much faster processing, especially with large batches.
-
 - Lossless in PNG means zero quality loss, while in JPEG it means visually lossless: the result is nearly indistinguishable from the original, but some data may be changed.
 
 - Select multiple files and folders as input for flexible batch processing.
@@ -114,10 +111,9 @@ or use the always-latest direct link:
 
 - **Input:** PNG, JPEG, WebP, AVIF, TIFF, BMP, GIF, and more
 - **Output:** PNG, JPEG (jpegli), WebP, AVIF
-- **Resizing:** Multi-resolution, fit/crop/width/height modes
+- **Resizing:** Multi-resolution, fit/crop/width/height modes, powered by [libvips](https://www.libvips.org/) for speed and low memory use
 - **Metadata:** Optionally strip all EXIF/IPTC/XMP
 - **Threading:** Multi-core, multi-threaded batch processing
-- **GPU:** OpenCL/CUDA acceleration for ImageMagick (if available for resizing)
 
 ## 📦 Supported Formats & Tech
 
@@ -143,38 +139,37 @@ or use the always-latest direct link:
   <li><b>ICO</b> (.ico)</li>
 </ul>
 
-<i>And many more common raster image formats supported by ImageMagick.</i>
+<i>And many more common raster image formats supported by Pillow and its plugins.</i>
 
 </details>
 
 - **Output:** PNG, JPEG (jpegli), WebP, AVIF
-- **Resizing:** Multi-resolution, fit/crop/width/height modes
-- **Metadata:** Optionally strip all EXIF/IPTC/XMP
+- **Resizing:** Multi-resolution, fit/crop/width/height modes, powered by [libvips](https://www.libvips.org/)
+- **Metadata:** Optionally strip all EXIF/IPTC/XMP via [exiftool](https://exiftool.org/)
 - **Threading:** Multi-core, multi-threaded batch processing
-- **GPU:** OpenCL/CUDA acceleration for ImageMagick (if available)
-  - [oxipng](https://github.com/shssoichiro/oxipng) (for PNG optimization)
-  - [pngquant](https://pngquant.org/) (for lossy PNG)
-  - [exiftool](https://exiftool.org/) (for metadata removal)
+- **PNG optimization:** [oxipng](https://github.com/shssoichiro/oxipng) (lossless) and [libimagequant](https://github.com/ImageOptim/libimagequant) (lossy palette reduction)
 - **Installer:** Built with [Inno Setup](https://jrsoftware.org/isinfo.php)
 - **GUI:** Built with [PySide6 (Qt for Python)](https://doc.qt.io/qtforpython/)
-- **Portable binaries** are bundled in the installer for reliability
+- **Portable binaries** (jpegli, exiftool) are bundled in the installer for reliability; all other format decoding, resizing, and encoding runs through in-process Python libraries
 - **No internet required** after install
 
 ---
 
 ## 📝 Credits & Acknowledgments
 
-- **ImageMagick** — [imagemagick.org](https://imagemagick.org/)
+- **libvips** — [libvips.org](https://www.libvips.org/) (via [pyvips](https://github.com/libvips/pyvips))
 - **jpegli** — [github.com/google/jpegli](https://github.com/google/jpegli)
-- **libwebp/cwebp** — [developers.google.com/speed/webp](https://developers.google.com/speed/webp)
-- **libavif/avifenc** — [github.com/AOMediaCodec/libavif](https://github.com/AOMediaCodec/libavif)
-- **oxipng** — [github.com/shssoichiro/oxipng](https://github.com/shssoichiro/oxipng)
-- **pngquant** — [pngquant.org](https://pngquant.org/)
+- **Pillow** — [python-pillow.org](https://python-pillow.org/)
+- **libavif** — [github.com/AOMediaCodec/libavif](https://github.com/AOMediaCodec/libavif) (via [pillow-avif-plugin](https://github.com/fdintino/pillow-avif-plugin))
+- **libheif** — [github.com/strukturag/libheif](https://github.com/strukturag/libheif) (via [pillow-heif](https://github.com/bigcat88/pillow_heif))
+- **libjxl** — [github.com/libjxl/libjxl](https://github.com/libjxl/libjxl) (via [pillow-jxl-plugin](https://github.com/Isotr0py/pillow-jpegxl-plugin))
+- **oxipng** — [github.com/shssoichiro/oxipng](https://github.com/shssoichiro/oxipng) (via [pyoxipng](https://github.com/nfrasser/pyoxipng))
+- **libimagequant** — [github.com/ImageOptim/libimagequant](https://github.com/ImageOptim/libimagequant) (via [imagequant](https://github.com/wanadev/imagequant-python))
 - **exiftool** — [exiftool.org](https://exiftool.org/)
 - **PySide6** — [doc.qt.io/qtforpython/](https://doc.qt.io/qtforpython/)
 - **Inno Setup** — [jrsoftware.org/isinfo.php](https://jrsoftware.org/isinfo.php)
 
-> All trademarks and copyrights belong to their respective owners. This project simply bundles and orchestrates these tools for user convenience.
+> All trademarks and copyrights belong to their respective owners. This project bundles and orchestrates these tools and libraries for user convenience.
 
 ---
 
@@ -225,7 +220,7 @@ or use the always-latest direct link:
 
 This project is licensed under the **GNU General Public License v3.0 or later (GPLv3+)**. See [`LICENSE.txt`](LICENSE.txt) for full terms.
 
-> **Note:** Bundled binaries (ImageMagick, jpegli, cwebp, avifenc, oxipng, pngquant, exiftool, etc.) are distributed under their respective open source licenses. Please refer to their official sites for more information.
+> **Note:** Bundled binaries (jpegli, exiftool) and the Python libraries used for format decoding, resizing, and encoding (Pillow, pillow-avif-plugin, pillow-heif, pillow-jxl-plugin, pyvips, pyoxipng, imagequant) are distributed under their respective open source licenses. Please refer to their official sites for more information.
 
 ---
 

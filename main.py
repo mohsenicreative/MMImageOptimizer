@@ -16,6 +16,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Union
 
+import imagequant
+import oxipng
+import pillow_avif  # noqa: F401 -- registers the AVIF plugin with Pillow
+import pillow_heif
+import pillow_jxl  # noqa: F401 -- registers the JPEG XL plugin with Pillow
+import pyvips
+from PIL import Image
 from pymage_size import get_image_size
 from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
@@ -52,6 +59,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+pillow_heif.register_heif_opener()  # registers the HEIC/HEIF plugin with Pillow
 
 
 # --- Robust Path Helper for Windows Long/Unicode Paths ---
@@ -147,12 +156,7 @@ def get_localappdata_folder():
 
 # Use pathlib for robust path handling
 RESOURCES_DIR = get_resources_folder()
-MAGICK = RESOURCES_DIR / "magick.exe"
-CWEBP = RESOURCES_DIR / "cwebp.exe"
-AVIFENC = RESOURCES_DIR / "avifenc.exe"
 CJPEGLI = RESOURCES_DIR / "cjpegli.exe"
-OXIPNG = RESOURCES_DIR / "oxipng.exe"
-PNGQUANT = RESOURCES_DIR / "pngquant.exe"
 EXIFTOOL = RESOURCES_DIR / "exiftool.exe"
 
 FORMATS = ["PNG", "JPEG", "WebP", "AVIF"]
@@ -206,30 +210,6 @@ def svg_to_icon(svg_str, color="#181818", size=(24, 24), type="icon"):
         return QIcon(pixmap)
     else:
         return pixmap
-
-
-def detect_gpu_acceleration():
-    """Detect if GPU acceleration is available for ImageMagick"""
-    try:
-        result = subprocess.run(
-            [str(MAGICK), "-list", "configure"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        output = result.stdout.lower()
-
-        # Check for OpenCL or CUDA support
-        has_opencl = "opencl" in output
-        has_cuda = "cuda" in output
-
-        return {
-            "available": has_opencl or has_cuda,
-            "opencl": has_opencl,
-            "cuda": has_cuda,
-        }
-    except:
-        return {"available": False, "opencl": False, "cuda": False}
 
 
 def get_optimal_thread_count():
@@ -345,17 +325,9 @@ class FileStats:
 
 
 # --- Robust call helper using robust_path ---
-def call(args, progress_callback=None, use_gpu=False):
+def call(args, progress_callback=None):
     """Helper to call subprocess silently without console windows, robust to long/Unicode paths."""
     str_args = [robust_path(arg) for arg in args]
-
-    # Add GPU acceleration if available and requested
-    if use_gpu and str_args[0].endswith("magick.exe"):
-        gpu_info = detect_gpu_acceleration()
-        if gpu_info["available"]:
-            if gpu_info["opencl"]:
-                str_args.insert(1, "-define")
-                str_args.insert(2, "accelerate:auto-threshold=1")
 
     startupinfo = None
     if platform.system() == "Windows":
@@ -405,10 +377,8 @@ class ImageProcessor:
             return True
         return False
 
-    """Class to handle individual image processing with GPU support"""
-
-    def __init__(self, use_gpu=False):
-        self.use_gpu = use_gpu
+    def __init__(self):
+        self.errors = []
 
     def process_single_image(
         self,
@@ -544,8 +514,8 @@ class ImageProcessor:
         if input_path.suffix.lower() == ".png":
             shutil.copyfile(robust_path(input_path), robust_path(out_png))
         else:
-            cmd = [MAGICK, robust_path(input_path), robust_path(out_png)]
-            call(cmd, use_gpu=self.use_gpu)
+            with Image.open(robust_path(input_path)) as img:
+                img.save(robust_path(out_png), "PNG")
         return out_png
 
     def sort_res_modes(self, res_modes):
@@ -623,23 +593,23 @@ class ImageProcessor:
                 target_height = int(orig_height * pct)
                 if target_width < 1 or target_height < 1:
                     continue  # Skip tiny sizes
-                resize_str = f"{target_width}x{target_height}"
             else:  # Pixel size
                 target_size = int(validated_size)
+                aspect = orig_width / orig_height
                 if mode in ["fit", "crop"]:
                     # Preserve aspect ratio for fit/crop
-                    aspect = orig_width / orig_height
                     if orig_width > orig_height:
                         target_width = target_size
-                        target_height = int(target_size / aspect)
+                        target_height = max(1, int(target_size / aspect))
                     else:
                         target_height = target_size
-                        target_width = int(target_size * aspect)
-                    resize_str = f"{target_width}x{target_height}"
+                        target_width = max(1, int(target_size * aspect))
                 elif mode == "width":
-                    resize_str = f"{target_size}x"
+                    target_width = target_size
+                    target_height = max(1, int(target_size / aspect))
                 elif mode == "height":
-                    resize_str = f"x{target_size}"
+                    target_height = target_size
+                    target_width = max(1, int(target_size * aspect))
                 else:
                     raise ValueError(f"Unknown mode: {mode}")
 
@@ -649,34 +619,24 @@ class ImageProcessor:
 
             out_path = tmp_dir / f"{base_name}_{validated_size}.png"
 
-            # Build cmd with quality flags
-            cmd_base = [
-                MAGICK,
-                robust_path(input_path),
-                "-colorspace",
-                "RGB",
-                "-filter",
-                "RobidouxSharp",  # Your high-quality filter
-            ]
-
-            if mode == "crop":
-                cmd = cmd_base + [
-                    "-resize",
-                    f"{resize_str}^",
-                    "-gravity",
-                    "center",
-                    "-extent",
-                    f"{target_width}x{target_height}",
-                ]
-            else:
-                cmd = cmd_base + ["-resize", resize_str]
-
-            cmd += ["-colorspace", "sRGB", robust_path(out_path)]
-
             try:
-                call(cmd, use_gpu=self.use_gpu)
+                if mode == "crop":
+                    resized_img = pyvips.Image.thumbnail(
+                        robust_path(input_path),
+                        target_width,
+                        height=target_height,
+                        crop=pyvips.Interesting.CENTRE,
+                    )
+                else:
+                    resized_img = pyvips.Image.thumbnail(
+                        robust_path(input_path),
+                        target_width,
+                        height=target_height,
+                        size=pyvips.Size.FORCE,
+                    )
+                resized_img.write_to_file(robust_path(out_path))
                 intermediates[validated_size] = out_path
-            except subprocess.CalledProcessError as e:
+            except pyvips.Error as e:
                 # Robust: Skip and log instead of crashing
                 self.errors.append(f"Error resizing to {validated_size}: {e}")
                 continue  # Or raise if critical
@@ -684,27 +644,12 @@ class ImageProcessor:
         return intermediates
 
     def encode_webp(self, in_png, out_path, quality):
-        cmd = [
-            CWEBP,
-            "-q",
-            str(quality),
-            robust_path(in_png),
-            "-o",
-            robust_path(out_path),
-        ]
-        call(cmd)
+        with Image.open(robust_path(in_png)) as img:
+            img.save(robust_path(out_path), "WEBP", quality=quality)
 
     def encode_avif(self, in_png, out_path, quality):
-        cmd = [
-            AVIFENC,
-            "-q",
-            str(quality),
-            "--speed",
-            "2",
-            robust_path(in_png),
-            robust_path(out_path),
-        ]
-        call(cmd)
+        with Image.open(robust_path(in_png)) as img:
+            img.save(robust_path(out_path), "AVIF", quality=quality, speed=2)
 
     def encode_jpegli(
         self, in_png, out_path, quality=None, lossless=False, chroma_444=False
@@ -728,40 +673,33 @@ class ImageProcessor:
         call(cmd)
 
     def encode_png(self, in_png, out_path, quality=None, lossless=True):
-        oxi_cmd = [
-            OXIPNG,
-            "--opt",
-            "max",
-            "--zopfli",
-            "--force",
-            "--out",
-            robust_path(out_path),
-            robust_path(in_png),
-            "--timeout",
-            "30",
-            "--interlace",
-            "0",
-        ]
-        if not lossless:
-            oxi_cmd.append("--scale16")
-        call(oxi_cmd)
+        in_png = robust_path(in_png)
+        out_path = robust_path(out_path)
+
+        oxipng.optimize(
+            in_png,
+            out_path,
+            level=6,  # equivalent to CLI's "--opt max"
+            deflate=oxipng.Deflaters.zopfli(15),  # CLI's "--zopfli" default iterations
+            force=True,
+            timeout=30,
+            interlace=oxipng.Interlacing.Off,
+            scale_16=not lossless,
+        )
 
         if not lossless:
-            # If not lossless, use pngquant for further optimization
+            # If not lossless, use imagequant for further (lossy) optimization
             if quality is None:
                 quality = 82
-            pq_cmd = [
-                PNGQUANT,
-                "--quality",
-                f"{max(quality - 15, 50)}-{quality}",
-                "--speed",
-                "1",
-                "--output",
-                robust_path(out_path),
-                "--force",
-                robust_path(out_path),
-            ]
-            call(pq_cmd)
+            with Image.open(out_path) as img:
+                quantized = imagequant.quantize_pil_image(
+                    img.convert("RGBA"),
+                    dithering_level=1.0,
+                    max_colors=256,
+                    min_quality=max(quality - 15, 50),
+                    max_quality=quality,
+                )
+            quantized.save(out_path, format="PNG")
 
 
 class ProcessingThread(QThread):
@@ -785,7 +723,6 @@ class ProcessingThread(QThread):
         strip_meta,
         recursive,
         thread_count,
-        use_gpu,
     ):
         super().__init__()
         self.processor = processor
@@ -798,7 +735,6 @@ class ProcessingThread(QThread):
         self.strip_meta = strip_meta
         self.recursive = recursive
         self.thread_count = thread_count
-        self.use_gpu = use_gpu
         self.total_stats = FileStats()
 
     def run(self):
@@ -884,9 +820,7 @@ class ProcessingThread(QThread):
         # Process images using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
             # Create processor instances for each thread
-            processors = [
-                ImageProcessor(self.use_gpu) for _ in range(self.thread_count)
-            ]
+            processors = [ImageProcessor() for _ in range(self.thread_count)]
 
             # Submit all tasks
             futures = []
@@ -1343,7 +1277,6 @@ class MainWin(QWidget):
         self.input_dir = ""
         self.output_dir = ""
         self.processing_thread = None
-        self.gpu_info = detect_gpu_acceleration()
         self.process_completed = False
 
         QApplication.instance().paletteChanged.connect(self.apply_icon_style)
@@ -1479,21 +1412,7 @@ class MainWin(QWidget):
         extra_layout.addWidget(thread_label)
         extra_layout.addWidget(self.thread_count_spin)
         extra_layout.addWidget(QLabel(f"(Optimal: {get_optimal_thread_count()})"))
-
-        self.gpu_check = QCheckBox("Enable GPU Acceleration")
-        self.gpu_check.setChecked(self.gpu_info["available"])
-        self.gpu_check.setEnabled(self.gpu_info["available"])
-        if self.gpu_info["available"]:
-            gpu_text = "GPU acceleration available"
-            if self.gpu_info["opencl"]:
-                gpu_text += " (OpenCL)"
-            if self.gpu_info["cuda"]:
-                gpu_text += " (CUDA)"
-        else:
-            gpu_text = "GPU acceleration not available"
-        self.gpu_check.setToolTip(gpu_text)
         extra_layout.addSpacing(30)
-        extra_layout.addWidget(self.gpu_check)
 
         self.stripMeta_check = QCheckBox("Strip Metadata")
         self.stripMeta_check.setChecked(True)
@@ -1964,7 +1883,6 @@ class MainWin(QWidget):
         strip_meta = self.stripMeta_check.isChecked()
         recursive = self.recursiveCheck.isChecked()
         thread_count = self.thread_count_spin.value()
-        use_gpu = self.gpu_check.isChecked() and self.gpu_info["available"]
 
         # Start processing in thread
         self.btnGo.setEnabled(False)
@@ -2001,7 +1919,7 @@ class MainWin(QWidget):
             self.processing_thread = None
 
         # Create and configure processor
-        processor = ImageProcessor(use_gpu)
+        processor = ImageProcessor()
 
         self.processing_thread = ProcessingThread(
             processor,
@@ -2014,7 +1932,6 @@ class MainWin(QWidget):
             strip_meta,
             recursive,
             thread_count,
-            use_gpu,
         )
         self.processing_thread.progress_updated.connect(self.update_progress)
         self.processing_thread.status_updated.connect(self.update_status)
