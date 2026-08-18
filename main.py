@@ -10,9 +10,10 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import unicodedata
 import winreg
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
 from typing import Union
 
@@ -24,11 +25,13 @@ import pillow_jxl  # noqa: F401 -- registers the JPEG XL plugin with Pillow
 import pyvips
 from PIL import Image
 from pymage_size import get_image_size
-from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
+    QColor,
     QDragEnterEvent,
     QDropEvent,
     QIcon,
+    QImage,
     QPainter,
     QPalette,
     QPixmap,
@@ -55,7 +58,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -301,6 +303,8 @@ class FileStats:
         self.original_size = 0
         self.optimized_size = 0
         self.files_processed = 0
+        self.skipped_files = 0
+        self.errors = []
 
     def add_file(self, original_size, optimized_size):
         self.original_size += original_size
@@ -391,6 +395,7 @@ class ImageProcessor:
         qlossless_map,
         strip_meta,
         output_dir,
+        skip_existing=False,
     ):
         # Pre-check for invalid or reserved file names (Windows)
         errors = []
@@ -442,9 +447,9 @@ class ImageProcessor:
             if "PNG" in formats:
                 try:
                     png_out = output_dir / f"{filename_base}.png"
-                    if png_out.exists():
-                        if not self.ask_overwrite(png_out):
-                            continue
+                    if png_out.exists() and skip_existing:
+                        stats.skipped_files += 1
+                        continue
                     shutil.copyfile(robust_path(source_png), robust_path(png_out))
                     self.encode_png(
                         robust_path(source_png),
@@ -460,9 +465,9 @@ class ImageProcessor:
             if "WebP" in formats:
                 try:
                     webp_out = output_dir / f"{filename_base}.webp"
-                    if webp_out.exists():
-                        if not self.ask_overwrite(webp_out):
-                            continue
+                    if webp_out.exists() and skip_existing:
+                        stats.skipped_files += 1
+                        continue
                     self.encode_webp(
                         robust_path(source_png),
                         robust_path(webp_out),
@@ -476,9 +481,9 @@ class ImageProcessor:
             if "AVIF" in formats:
                 try:
                     avif_out = output_dir / f"{filename_base}.avif"
-                    if avif_out.exists():
-                        if not self.ask_overwrite(avif_out):
-                            continue
+                    if avif_out.exists() and skip_existing:
+                        stats.skipped_files += 1
+                        continue
                     self.encode_avif(
                         robust_path(source_png),
                         robust_path(avif_out),
@@ -492,9 +497,9 @@ class ImageProcessor:
             if "JPEG" in formats:
                 try:
                     jpg_out = output_dir / f"{filename_base}.jpg"
-                    if jpg_out.exists():
-                        if not self.ask_overwrite(jpg_out):
-                            continue
+                    if jpg_out.exists() and skip_existing:
+                        stats.skipped_files += 1
+                        continue
                     self.encode_jpegli(
                         robust_path(source_png),
                         robust_path(jpg_out),
@@ -708,6 +713,7 @@ class ProcessingThread(QThread):
     progress_updated = Signal(int, int)  # current, total
     status_updated = Signal(str)
     stats_updated = Signal(object)  # FileStats object
+    file_completed = Signal(str, object, str, list)  # filename, QImage|None, status, errors
     finished = Signal()
     error_occurred = Signal(str)
 
@@ -723,6 +729,8 @@ class ProcessingThread(QThread):
         strip_meta,
         recursive,
         thread_count,
+        preserve_structure=False,
+        skip_existing=False,
     ):
         super().__init__()
         self.processor = processor
@@ -735,7 +743,33 @@ class ProcessingThread(QThread):
         self.strip_meta = strip_meta
         self.recursive = recursive
         self.thread_count = thread_count
+        self.preserve_structure = preserve_structure
+        self.skip_existing = skip_existing
         self.total_stats = FileStats()
+        self._cancel_event = threading.Event()
+        self._resume_event = threading.Event()
+        self._resume_event.set()  # not paused by default
+        self.was_cancelled = False
+        self._futures = []
+        self._futures_lock = threading.Lock()
+
+    def request_cancel(self):
+        self.was_cancelled = True
+        self._cancel_event.set()
+        self._resume_event.set()  # unblock if currently paused, so cancel can take effect
+        # Proactively cancel every not-yet-started future right now. Waiting for the
+        # results loop to reach them is too late: by then the executor's worker thread
+        # has typically already picked them up, since it doesn't wait on our consumption
+        # pace.
+        with self._futures_lock:
+            for future, _ in self._futures:
+                future.cancel()
+
+    def request_pause(self):
+        self._resume_event.clear()
+
+    def request_resume(self):
+        self._resume_event.set()
 
     def run(self):
         try:
@@ -745,7 +779,12 @@ class ProcessingThread(QThread):
             self.error_occurred.emit(str(e))
 
     def gather_image_files(self, sources, recursive=False):
-        """Given a list of Path objects (files or folders), return a flat list of image files"""
+        """Given a list of Path objects (files or folders), return [(file, relative_dir), ...].
+
+        relative_dir is the file's parent directory relative to whichever source
+        folder it was found under (Path('.') for files given directly, or found
+        directly inside a non-recursive folder scan).
+        """
         exts = {
             ".jpg",
             ".jpeg",
@@ -779,16 +818,71 @@ class ProcessingThread(QThread):
             src = Path(src)
             if src.is_dir():
                 if recursive:
-                    for ext in exts:
-                        image_files.extend(src.rglob(f"*{ext}"))
-                        image_files.extend(src.rglob(f"*{ext.upper()}"))
+                    seen = set()
+                    for f in src.rglob("*"):
+                        if f.is_file() and f.suffix.lower() in exts:
+                            resolved = f.resolve()
+                            if resolved in seen:
+                                continue
+                            seen.add(resolved)
+                            image_files.append((f, f.parent.relative_to(src)))
                 else:
                     for f in src.iterdir():
                         if f.is_file() and f.suffix.lower() in exts:
-                            image_files.append(f)
+                            image_files.append((f, Path(".")))
             elif src.is_file() and src.suffix.lower() in exts:
-                image_files.append(src)
+                image_files.append((src, Path(".")))
         return image_files
+
+    @staticmethod
+    def make_thumbnail(file_path, size=40):
+        """Build a small QImage thumbnail off the GUI thread (QImage is thread-safe;
+        QPixmap/QIcon are not and must only be touched on the GUI thread)."""
+        try:
+            with Image.open(robust_path(file_path)) as img:
+                img = img.convert("RGBA")
+                img.thumbnail((size, size))
+                data = img.tobytes("raw", "RGBA")
+                qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+                return qimg.copy()  # own its buffer before the source bytes go away
+        except Exception:
+            return None
+
+    @staticmethod
+    def determine_status(stats):
+        if stats.errors and stats.files_processed == 0:
+            return "fail"
+        if stats.errors:
+            return "partial"
+        if stats.files_processed == 0 and stats.skipped_files > 0:
+            return "skip"
+        return "success"
+
+    def _process_one(self, processor, file_path, thread_tmp_dir, effective_output_dir):
+        # Submitting to the executor doesn't block, so by the time a worker thread
+        # actually picks this up, a huge batch may already be fully queued. Pause and
+        # cancel therefore have to be checked here -- right before real work starts --
+        # not just in the submission loop, or they'd have nothing left to gate.
+        while not self._resume_event.wait(timeout=0.2):
+            if self._cancel_event.is_set():
+                break
+        if self._cancel_event.is_set():
+            return None
+
+        thumbnail = self.make_thumbnail(file_path)
+        stats = processor.process_single_image(
+            file_path,
+            thread_tmp_dir,
+            file_path.stem,
+            self.resolutions,
+            self.formats,
+            self.qmap,
+            self.qlossless_map,
+            self.strip_meta,
+            effective_output_dir,
+            self.skip_existing,
+        )
+        return stats, thumbnail
 
     def process_images_multithreaded(self):
         """Process images using multiple threads"""
@@ -802,6 +896,7 @@ class ProcessingThread(QThread):
 
         if total_files == 0:
             self.status_updated.emit("No image files found")
+            shutil.rmtree(tmp_dir)
             return
 
         self.status_updated.emit(
@@ -822,44 +917,74 @@ class ProcessingThread(QThread):
             # Create processor instances for each thread
             processors = [ImageProcessor() for _ in range(self.thread_count)]
 
-            # Submit all tasks
+            # Submit tasks, respecting cancel/pause requests as we go
             futures = []
-            for i, file_path in enumerate(image_files):
+            for i, (file_path, rel_dir) in enumerate(image_files):
+                if self._cancel_event.is_set():
+                    break
+                # Block here while paused; keep checking for cancel in the meantime
+                while not self._resume_event.wait(timeout=0.2):
+                    if self._cancel_event.is_set():
+                        break
+                if self._cancel_event.is_set():
+                    break
+
                 thread_id = i % self.thread_count
                 processor = processors[thread_id]
                 thread_tmp_dir = thread_tmp_dirs[thread_id]
+                effective_output_dir = (
+                    self.output_dir / rel_dir if self.preserve_structure else self.output_dir
+                )
+                effective_output_dir.mkdir(parents=True, exist_ok=True)
 
                 future = executor.submit(
-                    processor.process_single_image,
+                    self._process_one,
+                    processor,
                     file_path,
                     thread_tmp_dir,
-                    file_path.stem,
-                    self.resolutions,
-                    self.formats,
-                    self.qmap,
-                    self.qlossless_map,
-                    self.strip_meta,
-                    self.output_dir,
+                    effective_output_dir,
                 )
                 futures.append((future, file_path.name))
+                with self._futures_lock:
+                    self._futures.append((future, file_path.name))
 
             # Process completed tasks
             for future, filename in futures:
-                try:
-                    stats = future.result()
-                    self.total_stats.original_size += stats.original_size
-                    self.total_stats.optimized_size += stats.optimized_size
-                    self.total_stats.files_processed += 1
+                if future.cancelled():
+                    continue  # cancelled before it ever started running
 
+                try:
+                    result = future.result()
+                except CancelledError:
+                    continue
+                except Exception as e:
                     completed_files += 1
                     self.progress_updated.emit(completed_files, total_files)
-                    self.status_updated.emit(
-                        f"Processed: {filename} ({completed_files}/{total_files})"
-                    )
-                    self.stats_updated.emit(self.total_stats)
-
-                except Exception as e:
                     self.status_updated.emit(f"Error processing {filename}: {str(e)}")
+                    self.file_completed.emit(filename, None, "fail", [str(e)])
+                    continue
+
+                if result is None:
+                    continue  # bailed out due to cancel before doing any real work
+                stats, thumbnail = result
+
+                self.total_stats.original_size += stats.original_size
+                self.total_stats.optimized_size += stats.optimized_size
+                self.total_stats.files_processed += 1
+                self.total_stats.skipped_files += stats.skipped_files
+
+                completed_files += 1
+                self.progress_updated.emit(completed_files, total_files)
+                self.status_updated.emit(
+                    f"Processed: {filename} ({completed_files}/{total_files})"
+                )
+                self.stats_updated.emit(self.total_stats)
+                self.file_completed.emit(
+                    filename, thumbnail, self.determine_status(stats), stats.errors
+                )
+
+        if self._cancel_event.is_set():
+            self.status_updated.emit(f"Cancelled ({completed_files}/{total_files} done)")
 
         # Cleanup
         shutil.rmtree(tmp_dir)
@@ -1272,16 +1397,17 @@ class MainWin(QWidget):
         self.setMinimumWidth(800)
         self.setMinimumHeight(600)
         self.setWindowIcon(svg_to_icon(MOHSENI_LOGO, type="icon"))
-        self.overwrite_policy = None
 
         self.input_dir = ""
         self.output_dir = ""
         self.processing_thread = None
         self.process_completed = False
+        self.all_errors = []
 
         QApplication.instance().paletteChanged.connect(self.apply_icon_style)
         self.apply_icon_style()
         self.initUI()
+        self.load_settings()
 
     def initUI(self):
         initial_icon_color = "#181818" if is_windows_light_theme() else "#ffffff"
@@ -1324,6 +1450,18 @@ class MainWin(QWidget):
         self.recursiveCheck.setChecked(False)
         self.recursiveCheck.setFixedHeight(16)
         self.recursiveCheck.setToolTip("Process images in subfolders as well")
+
+        self.preserveStructureCheck = QCheckBox("Preserve folder structure in output")
+        self.preserveStructureCheck.setChecked(False)
+        self.preserveStructureCheck.setEnabled(False)
+        self.preserveStructureCheck.setFixedHeight(16)
+        self.preserveStructureCheck.setToolTip(
+            "Mirror each input file's subfolder path into the output folder, "
+            "instead of flattening everything into one folder."
+        )
+        self.recursiveCheck.stateChanged.connect(
+            lambda state: self.preserveStructureCheck.setEnabled(bool(state))
+        )
 
         input_widget = QWidget()
         input_widget.setLayout(input_layout)
@@ -1391,6 +1529,7 @@ class MainWin(QWidget):
         folder_layout = QVBoxLayout(folder_group)
         folder_layout.addLayout(side_by_side)
         folder_layout.addWidget(self.recursiveCheck)
+        folder_layout.addWidget(self.preserveStructureCheck)
         folder_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         folder_group.setLayout(folder_layout)
         layout.addWidget(folder_group)
@@ -1419,6 +1558,15 @@ class MainWin(QWidget):
         extra_layout.addWidget(self.stripMeta_check)
         self.stripMeta_check.setToolTip(
             "If checked, removes metadata from output images to reduce size."
+        )
+        extra_layout.addSpacing(30)
+
+        self.skipExisting_check = QCheckBox("Skip Existing Files")
+        self.skipExisting_check.setChecked(False)
+        extra_layout.addWidget(self.skipExisting_check)
+        self.skipExisting_check.setToolTip(
+            "If checked, output files that already exist are left alone instead "
+            "of being overwritten."
         )
         extra_layout.addSpacing(30)
 
@@ -1578,16 +1726,50 @@ class MainWin(QWidget):
         self.progress_bar.setToolTip("Shows the progress of current batch processing.")
         progress_layout.addWidget(self.progress_bar)
 
-        # Statistics display
-        self.stats_text = QTextEdit()
-        self.stats_text.setReadOnly(True)
-        self.stats_text.setVisible(True)
-        self.stats_text.setToolTip("Summary of file sizes and compression ratio.")
-        # Make the stats area expand as the group grows
-        self.stats_text.setSizePolicy(
+        # Cancel / Pause controls (enabled only while a batch is running)
+        control_row = QHBoxLayout()
+        self.btnPause = QPushButton("Pause")
+        self.btnPause.setEnabled(False)
+        self.btnPause.setToolTip("Pause after the currently running files finish.")
+        self.btnPause.clicked.connect(self.togglePauseResume)
+        control_row.addWidget(self.btnPause)
+        self.btnCancel = QPushButton("Cancel")
+        self.btnCancel.setEnabled(False)
+        self.btnCancel.setToolTip("Stop after the currently running files finish.")
+        self.btnCancel.clicked.connect(self.cancelProcessing)
+        control_row.addWidget(self.btnCancel)
+        progress_layout.addLayout(control_row)
+
+        # Compact aggregate summary
+        self.stats_summary_label = QLabel("")
+        self.stats_summary_label.setWordWrap(True)
+        self.stats_summary_label.setToolTip("Summary of file sizes and compression ratio.")
+        progress_layout.addWidget(self.stats_summary_label)
+
+        # Per-file status list
+        self.fileTable = QTableWidget(0, 3)
+        self.fileTable.setHorizontalHeaderLabels(["", "File", "Status"])
+        self.fileTable.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Fixed
+        )
+        self.fileTable.setColumnWidth(0, 44)
+        self.fileTable.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.fileTable.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.fileTable.verticalHeader().setVisible(False)
+        self.fileTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.fileTable.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.fileTable.setIconSize(QSize(32, 32))
+        self.fileTable.setToolTip(
+            "Per-file processing results. Hover a status for error details."
+        )
+        self.fileTable.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        progress_layout.addWidget(self.stats_text, stretch=2)
+        progress_layout.addWidget(self.fileTable, stretch=2)
 
         # Start button (large, inside progress group)
         self.btnGo = QPushButton("Start Optimization")
@@ -1609,34 +1791,87 @@ class MainWin(QWidget):
         main_hbox.addWidget(progress_group, 3)
         layout.addLayout(main_hbox)
 
-    def ask_overwrite(self, file_path):
-        if self.overwrite_policy == "overwrite_all":
-            return True
-        elif self.overwrite_policy == "skip_all":
-            return False
+    def _settings(self):
+        return QSettings("Mohammadreza Mohseni", "MM Image Optimizer")
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle("File Exists")
-        msg.setText(f"Output file already exists:\n{file_path}\nOverwrite?")
-        overwrite = msg.addButton("Overwrite", QMessageBox.YesRole)
-        skip = msg.addButton("Skip", QMessageBox.NoRole)
-        overwrite_all = msg.addButton("Overwrite All", QMessageBox.AcceptRole)
-        skip_all = msg.addButton("Skip All", QMessageBox.RejectRole)
-        msg.setIcon(QMessageBox.Warning)
-        msg.exec()
+    def save_settings(self):
+        settings = self._settings()
+        settings.setValue("output_dir", self.output_dir)
+        settings.setValue("recursive", self.recursiveCheck.isChecked())
+        settings.setValue("preserve_structure", self.preserveStructureCheck.isChecked())
+        settings.setValue("skip_existing", self.skipExisting_check.isChecked())
+        settings.setValue("strip_meta", self.stripMeta_check.isChecked())
+        settings.setValue("thread_count", self.thread_count_spin.value())
+        settings.setValue("no_resize", self.NoResize.isChecked())
+        settings.setValue("window_size", self.size())
 
-        clicked = msg.clickedButton()
-        if clicked == overwrite:
-            return True
-        elif clicked == overwrite_all:
-            self.overwrite_policy = "overwrite_all"
-            return True
-        elif clicked == skip:
-            return False
-        elif clicked == skip_all:
-            self.overwrite_policy = "skip_all"
-            return False
-        return False
+        for fmt in FORMATS:
+            settings.setValue(f"format_{fmt}_enabled", self.formatChecks[fmt].isChecked())
+            settings.setValue(f"format_{fmt}_quality", self.qualityWidgets[fmt].value())
+            settings.setValue(
+                f"format_{fmt}_lossless", self.losslessWidgets[fmt].isChecked()
+            )
+
+        rows = []
+        for row in range(self.resTable.rowCount()):
+            size_item = self.resTable.item(row, 0)
+            mode_cb = self.resTable.cellWidget(row, 1)
+            if size_item and mode_cb:
+                rows.append(f"{size_item.text()}|{mode_cb.currentText()}")
+        settings.setValue("resolution_rows", rows)
+
+    def load_settings(self):
+        settings = self._settings()
+
+        output_dir = settings.value("output_dir", "", type=str)
+        if output_dir and Path(output_dir).is_dir():
+            self.set_output_folder(output_dir)
+
+        self.recursiveCheck.setChecked(settings.value("recursive", False, type=bool))
+        self.preserveStructureCheck.setChecked(
+            settings.value("preserve_structure", False, type=bool)
+        )
+        self.preserveStructureCheck.setEnabled(self.recursiveCheck.isChecked())
+        self.skipExisting_check.setChecked(settings.value("skip_existing", False, type=bool))
+        self.stripMeta_check.setChecked(settings.value("strip_meta", True, type=bool))
+        self.thread_count_spin.setValue(
+            settings.value("thread_count", get_optimal_thread_count(), type=int)
+        )
+        self.NoResize.setChecked(settings.value("no_resize", True, type=bool))
+
+        for fmt in FORMATS:
+            if settings.contains(f"format_{fmt}_enabled"):
+                self.formatChecks[fmt].setChecked(
+                    settings.value(f"format_{fmt}_enabled", type=bool)
+                )
+            if settings.contains(f"format_{fmt}_quality"):
+                self.qualityWidgets[fmt].setValue(
+                    settings.value(f"format_{fmt}_quality", type=int)
+                )
+            if settings.contains(f"format_{fmt}_lossless"):
+                self.losslessWidgets[fmt].setChecked(
+                    settings.value(f"format_{fmt}_lossless", type=bool)
+                )
+
+        rows = settings.value("resolution_rows", [], type=list)
+        if rows:
+            self.resTable.setRowCount(0)
+            for entry in rows:
+                if "|" not in entry:
+                    continue
+                size_str, mode = entry.split("|", 1)
+                self.addResRow(size_str, mode)
+
+        window_size = settings.value("window_size", None, type=QSize)
+        if window_size is not None and window_size.isValid():
+            self.resize(window_size)
+
+        self.update_quality_slider_states()
+        self.toggle_resize_controls(2 if self.NoResize.isChecked() else 0)
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
 
     def apply_icon_style(self):
         is_light = is_windows_light_theme()
@@ -1882,15 +2117,21 @@ class MainWin(QWidget):
         # Strip metadata option
         strip_meta = self.stripMeta_check.isChecked()
         recursive = self.recursiveCheck.isChecked()
+        preserve_structure = recursive and self.preserveStructureCheck.isChecked()
+        skip_existing = self.skipExisting_check.isChecked()
         thread_count = self.thread_count_spin.value()
 
         # Start processing in thread
         self.btnGo.setEnabled(False)
+        self.btnCancel.setEnabled(True)
+        self.btnPause.setEnabled(True)
+        self.btnPause.setText("Pause")
         self.status_label.setText("Preparing multi-threaded processing...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.stats_text.setVisible(True)
-        self.stats_text.clear()
+        self.stats_summary_label.setText("")
+        self.fileTable.setRowCount(0)
+        self.all_errors = []
         self.process_completed = False  # Reset guard flag at start
 
         # Clean up previous thread if it exists
@@ -1909,6 +2150,10 @@ class MainWin(QWidget):
                 pass
             try:
                 self.processing_thread.stats_updated.disconnect(self.update_stats)
+            except TypeError:
+                pass
+            try:
+                self.processing_thread.file_completed.disconnect(self.add_file_status_row)
             except TypeError:
                 pass
             try:
@@ -1932,10 +2177,13 @@ class MainWin(QWidget):
             strip_meta,
             recursive,
             thread_count,
+            preserve_structure,
+            skip_existing,
         )
         self.processing_thread.progress_updated.connect(self.update_progress)
         self.processing_thread.status_updated.connect(self.update_status)
         self.processing_thread.stats_updated.connect(self.update_stats)
+        self.processing_thread.file_completed.connect(self.add_file_status_row)
         self.processing_thread.finished.connect(self.processing_finished)
         self.processing_thread.error_occurred.connect(self.processing_error)
         self.processing_thread.start()
@@ -1959,29 +2207,76 @@ class MainWin(QWidget):
         self.status_label.setText(status)
 
     def update_stats(self, stats: FileStats):
-        """Update statistics display"""
+        """Update the compact aggregate summary label."""
         compression_ratio = stats.get_compression_ratio()
         size_saved = stats.get_size_saved()
 
-        stats_text = f"""
-            Files Processed: {stats.files_processed}
-            Original Size: {stats.format_size(stats.original_size)}
-            Optimized Size: {stats.format_size(stats.optimized_size)}
-            Size Saved: {stats.format_size(size_saved)}
-            Compression Ratio: {compression_ratio:.1f}%
-        """.strip()
+        summary = (
+            f"{stats.files_processed} processed"
+            + (f", {stats.skipped_files} skipped" if stats.skipped_files else "")
+            + f" · {stats.format_size(stats.original_size)} → "
+            f"{stats.format_size(stats.optimized_size)} "
+            f"(saved {stats.format_size(size_saved)}, {compression_ratio:.1f}%)"
+        )
+        self.stats_summary_label.setText(summary)
 
-        self.stats_text.setPlainText(stats_text)
-        # Collect errors for summary
-        if not hasattr(self, "all_errors"):
-            self.all_errors = []
-        if hasattr(stats, "errors") and stats.errors:
-            self.all_errors.extend(stats.errors)
+    def add_file_status_row(self, filename, thumbnail, status, errors):
+        """Add one row to the per-file status table (thumbnail + name + status)."""
+        row = self.fileTable.rowCount()
+        self.fileTable.insertRow(row)
+
+        icon_item = QTableWidgetItem()
+        if thumbnail is not None:
+            icon_item.setIcon(QIcon(QPixmap.fromImage(thumbnail)))
+        self.fileTable.setItem(row, 0, icon_item)
+
+        self.fileTable.setItem(row, 1, QTableWidgetItem(filename))
+
+        status_labels = {
+            "success": "Success",
+            "partial": "Partial",
+            "skip": "Skipped",
+            "fail": "Failed",
+        }
+        status_colors = {
+            "success": "#2e7d32",
+            "partial": "#b5890a",
+            "skip": "#888888",
+            "fail": "#c62828",
+        }
+        status_item = QTableWidgetItem(status_labels.get(status, status))
+        status_item.setForeground(QColor(status_colors.get(status, "#000000")))
+        if errors:
+            status_item.setToolTip("\n".join(errors))
+            self.all_errors.extend(errors)
+        self.fileTable.setItem(row, 2, status_item)
+        self.fileTable.scrollToBottom()
+
+    def cancelProcessing(self):
+        if self.processing_thread is not None:
+            self.processing_thread.request_cancel()
+            self.btnCancel.setEnabled(False)
+            self.btnPause.setEnabled(False)
+            self.status_label.setText("Cancelling... finishing files already in progress")
+
+    def togglePauseResume(self):
+        if self.processing_thread is None:
+            return
+        if self.btnPause.text() == "Pause":
+            self.processing_thread.request_pause()
+            self.btnPause.setText("Resume")
+            self.status_label.setText("Paused. Files already in progress will finish.")
+        else:
+            self.processing_thread.request_resume()
+            self.btnPause.setText("Pause")
 
     def processing_finished(self):
         if not self.process_completed:
+            was_cancelled = (
+                self.processing_thread is not None and self.processing_thread.was_cancelled
+            )
             # Show error summary if any
-            if hasattr(self, "all_errors") and self.all_errors:
+            if self.all_errors:
                 msg = "Some files could not be processed:\n\n" + "\n".join(
                     self.all_errors
                 )
@@ -1989,18 +2284,27 @@ class MainWin(QWidget):
                 self.all_errors = []
             self.process_completed = True
             self.btnGo.setEnabled(True)
+            self.btnCancel.setEnabled(False)
+            self.btnPause.setEnabled(False)
+            self.btnPause.setText("Pause")
             self.progress_bar.setVisible(False)
-            self.status_label.setText(
-                "Multi-threaded optimization completed successfully!"
-            )
-            QMessageBox.information(
-                self,
-                "Success",
-                "Image optimization completed!\nCheck the statistics for compression details.",
-            )
+            if was_cancelled:
+                self.status_label.setText("Optimization cancelled.")
+            else:
+                self.status_label.setText(
+                    "Multi-threaded optimization completed successfully!"
+                )
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    "Image optimization completed!\nCheck the statistics for compression details.",
+                )
 
     def processing_error(self, error_msg):
         self.btnGo.setEnabled(True)
+        self.btnCancel.setEnabled(False)
+        self.btnPause.setEnabled(False)
+        self.btnPause.setText("Pause")
         self.progress_bar.setVisible(False)
         self.status_label.setText("Error occurred during processing")
         QMessageBox.critical(self, "Error", f"Processing failed: {error_msg}")
