@@ -2,7 +2,7 @@
 MMImageOptimizer
 
 author: Mohammadreza Mohseni
-version: 1.3.0
+version: 1.3.1
 """
 
 import os
@@ -221,17 +221,22 @@ def get_optimal_thread_count():
     return max(1, min(8, int(cpu_count * 0.75)))
 
 
-def should_resize(input_img_path, target_size):
+def should_resize(input_img_path, target_size, mode="fit"):
     img = get_image_size(robust_path(input_img_path))
     width, height = img.get_dimensions()
 
     # Pixel value
     if isinstance(target_size, int):
-        # Don't upscale: skip if target size is larger than original
-        if target_size >= min(width, height):
-            return False
+        # Match the dimension generate_resized_variants actually targets for this
+        # mode: the long side for fit/crop, or the specific dimension for width/height.
+        if mode == "width":
+            basis = width
+        elif mode == "height":
+            basis = height
         else:
-            return True
+            basis = max(width, height)
+        # Don't upscale: skip if target size is larger than the relevant dimension
+        return target_size < basis
 
     # Percentage string, e.g., "50%"
     if isinstance(target_size, str) and target_size.endswith("%"):
@@ -441,7 +446,15 @@ class ImageProcessor:
 
         for res in resolutions:
             size = res["size"]
-            source_png = resized[size]
+            source_png = resized.get(size)
+            if source_png is None:
+                # Resize was skipped (e.g. would upscale the source) or failed;
+                # don't let one missing resolution take down the whole file.
+                errors.append(
+                    f"Skipped {size} ({res.get('mode', 'fit')}): source is already "
+                    "at or below this size, or the resize failed"
+                )
+                continue
             filename_base = base_name if size == "original" else f"{base_name}_{size}"
 
             if "PNG" in formats:
@@ -619,7 +632,7 @@ class ImageProcessor:
                     raise ValueError(f"Unknown mode: {mode}")
 
             # Skip if not downscaling (as per should_resize)
-            if not should_resize(input_path, validated_size):
+            if not should_resize(input_path, validated_size, mode):
                 continue
 
             out_path = tmp_dir / f"{base_name}_{validated_size}.png"
