@@ -161,13 +161,15 @@ Full details for every release are on the [Releases page](https://github.com/moh
 
 ### v1.3.1 — 2026-08-19
 
-Patch release fixing two significant bugs found immediately after v1.3.0 shipped.
+Patch release fixing bugs found immediately after v1.3.0 shipped. As a result, **v1.3.0 was pulled from Releases** — if you have it, update to v1.3.1.
 
 - Fixed a crash that could fail an entire batch when a requested resolution was at or above the source image's size
 - Fixed incorrect resize skips for non-square images in fit/crop/width/height modes
 - Fixed metadata stripping, which had silently never worked due to an incomplete bundled `exiftool`
 
-### v1.3.0 — 2026-08-19
+### ~~v1.3.0~~ — 2026-08-19 (pulled, superseded by v1.3.1)
+
+> Removed from Releases shortly after publishing: a common resize scenario (any custom resolution at or above the source image's size) crashed the whole file, and "Strip Metadata" silently never worked. Both are fixed in v1.3.1 above, which includes every feature below.
 
 **New features**
 
