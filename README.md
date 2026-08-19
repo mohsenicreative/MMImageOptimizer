@@ -159,6 +159,14 @@ or use the always-latest direct link:
 
 Full details for every release are on the [Releases page](https://github.com/mohsenicreative/MMImageOptimizer/releases).
 
+### v1.3.1 — 2026-08-19
+
+Patch release fixing two significant bugs found immediately after v1.3.0 shipped.
+
+- Fixed a crash that could fail an entire batch when a requested resolution was at or above the source image's size
+- Fixed incorrect resize skips for non-square images in fit/crop/width/height modes
+- Fixed metadata stripping, which had silently never worked due to an incomplete bundled `exiftool`
+
 ### v1.3.0 — 2026-08-19
 
 **New features**
